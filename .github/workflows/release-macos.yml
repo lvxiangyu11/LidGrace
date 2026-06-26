@@ -1,0 +1,179 @@
+name: Build and Release macOS
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build on macOS 15
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show macOS and Xcode info
+        run: |
+          sw_vers
+          xcodebuild -version
+          clang --version
+
+      - name: Build LidGrace
+        run: |
+          chmod +x Scripts/*.sh
+          ./Scripts/build.sh
+
+          test -d Build/LidGrace.app
+          test -x Build/LidGrace.app/Contents/MacOS/LidGrace
+          test -x Build/lidgraced
+          plutil -lint Build/LidGrace.app/Contents/Info.plist
+
+      - name: Ad-hoc sign app
+        run: |
+          codesign --force --deep --sign - Build/LidGrace.app
+          codesign --verify --deep --strict Build/LidGrace.app
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
+
+          mkdir -p Dist/LidGrace
+          cp -R Build/LidGrace.app Dist/LidGrace/
+          cp Build/lidgraced Dist/LidGrace/
+          cp README.md README_zh-CN.md LICENSE CHANGELOG.md Dist/LidGrace/ 2>/dev/null || true
+          cp Scripts/uninstall.sh Scripts/diagnose.sh Dist/LidGrace/ 2>/dev/null || true
+
+          cat > Dist/LidGrace/install-prebuilt.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          USER_ID="$(id -u)"
+          AGENT="$HOME/Library/LaunchAgents/com.local.lidgrace.app.plist"
+          DAEMON="/Library/LaunchDaemons/com.local.lidgrace.plist"
+          SHARED="/Library/Application Support/LidGrace"
+
+          sudo launchctl bootout system/com.local.lidgrace 2>/dev/null || true
+          launchctl bootout "gui/$USER_ID/com.local.lidgrace.app" 2>/dev/null || true
+
+          sudo mkdir -p /usr/local/sbin
+          sudo mkdir -p "$SHARED"
+          sudo chmod 777 "$SHARED"
+
+          sudo rm -rf /Applications/LidGrace.app
+          sudo cp -R "$ROOT/LidGrace.app" /Applications/LidGrace.app
+          sudo cp "$ROOT/lidgraced" /usr/local/sbin/lidgraced
+          sudo chmod 755 /usr/local/sbin/lidgraced
+
+          if [[ ! -f "$SHARED/config.json" ]]; then
+            sudo tee "$SHARED/config.json" >/dev/null <<'JSON'
+          {
+            "enabled": true,
+            "grace_seconds": 300,
+            "trigger_on_lid": true,
+            "trigger_on_display_sleep": true,
+            "trigger_on_screen_lock": true,
+            "lock_on_trigger": true
+          }
+          JSON
+          fi
+
+          sudo chmod 666 "$SHARED/config.json"
+          sudo chmod 777 "$SHARED"
+
+          sudo tee "$DAEMON" >/dev/null <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+           "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>Label</key>
+            <string>com.local.lidgrace</string>
+            <key>ProgramArguments</key>
+            <array>
+              <string>/bin/zsh</string>
+              <string>/usr/local/sbin/lidgraced</string>
+            </array>
+            <key>RunAtLoad</key>
+            <true/>
+            <key>KeepAlive</key>
+            <true/>
+            <key>StandardOutPath</key>
+            <string>/var/log/lidgrace.daemon.log</string>
+            <key>StandardErrorPath</key>
+            <string>/var/log/lidgrace.daemon.err</string>
+          </dict>
+          </plist>
+          PLIST
+
+          sudo chown root:wheel "$DAEMON"
+          sudo chmod 644 "$DAEMON"
+          plutil -lint "$DAEMON"
+
+          mkdir -p "$HOME/Library/LaunchAgents"
+
+          cat > "$AGENT" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+           "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>Label</key>
+            <string>com.local.lidgrace.app</string>
+            <key>ProgramArguments</key>
+            <array>
+              <string>/Applications/LidGrace.app/Contents/MacOS/LidGrace</string>
+            </array>
+            <key>RunAtLoad</key>
+            <true/>
+            <key>KeepAlive</key>
+            <true/>
+            <key>StandardOutPath</key>
+            <string>$HOME/Library/Logs/lidgrace.app.log</string>
+            <key>StandardErrorPath</key>
+            <string>$HOME/Library/Logs/lidgrace.app.err</string>
+          </dict>
+          </plist>
+          PLIST
+
+          chmod 644 "$AGENT"
+          plutil -lint "$AGENT"
+
+          sudo launchctl bootstrap system "$DAEMON"
+          sudo launchctl enable system/com.local.lidgrace
+          sudo launchctl kickstart -k system/com.local.lidgrace
+
+          launchctl bootstrap "gui/$USER_ID" "$AGENT"
+          launchctl enable "gui/$USER_ID/com.local.lidgrace.app"
+          launchctl kickstart -k "gui/$USER_ID/com.local.lidgrace.app"
+
+          open -a LidGrace || true
+          echo "Installed LidGrace."
+          SH
+
+          chmod +x Dist/LidGrace/install-prebuilt.sh
+          ditto -c -k --sequesterRsrc --keepParent Dist/LidGrace "LidGrace-${VERSION}-macos15-arm64.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LidGrace-macos15-arm64
+          path: LidGrace-*-macos15-arm64.zip
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            LidGrace-"$GITHUB_REF_NAME"-macos15-arm64.zip \
+            --title "LidGrace $GITHUB_REF_NAME" \
+            --notes "macOS 15 arm64 build."
