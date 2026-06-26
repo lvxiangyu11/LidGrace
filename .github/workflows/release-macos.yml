@@ -6,10 +6,15 @@ on:
       - main
     tags:
       - "v*"
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -18,7 +23,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Show macOS and Xcode info
         run: |
@@ -43,13 +50,26 @@ jobs:
 
       - name: Package
         run: |
-          VERSION="${GITHUB_REF_NAME:-dev}"
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="$GITHUB_REF_NAME"
+          else
+            VERSION="nightly"
+          fi
+
+          ZIP_NAME="LidGrace-${VERSION}-macos15-arm64.zip"
 
           mkdir -p Dist/LidGrace
           cp -R Build/LidGrace.app Dist/LidGrace/
           cp Build/lidgraced Dist/LidGrace/
-          cp README.md README_zh-CN.md LICENSE CHANGELOG.md Dist/LidGrace/ 2>/dev/null || true
-          cp Scripts/uninstall.sh Scripts/diagnose.sh Dist/LidGrace/ 2>/dev/null || true
+
+          cp README.md Dist/LidGrace/ 2>/dev/null || true
+          cp README_zh-CN.md Dist/LidGrace/ 2>/dev/null || true
+          cp LICENSE Dist/LidGrace/ 2>/dev/null || true
+          cp CHANGELOG.md Dist/LidGrace/ 2>/dev/null || true
+          cp Scripts/uninstall.sh Dist/LidGrace/ 2>/dev/null || true
+          cp Scripts/diagnose.sh Dist/LidGrace/ 2>/dev/null || true
 
           cat > Dist/LidGrace/install-prebuilt.sh <<'SH'
           #!/usr/bin/env bash
@@ -57,6 +77,7 @@ jobs:
 
           ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
           USER_ID="$(id -u)"
+
           AGENT="$HOME/Library/LaunchAgents/com.local.lidgrace.app.plist"
           DAEMON="/Library/LaunchDaemons/com.local.lidgrace.plist"
           SHARED="/Library/Application Support/LidGrace"
@@ -97,17 +118,22 @@ jobs:
           <dict>
             <key>Label</key>
             <string>com.local.lidgrace</string>
+
             <key>ProgramArguments</key>
             <array>
               <string>/bin/zsh</string>
               <string>/usr/local/sbin/lidgraced</string>
             </array>
+
             <key>RunAtLoad</key>
             <true/>
+
             <key>KeepAlive</key>
             <true/>
+
             <key>StandardOutPath</key>
             <string>/var/log/lidgrace.daemon.log</string>
+
             <key>StandardErrorPath</key>
             <string>/var/log/lidgrace.daemon.err</string>
           </dict>
@@ -128,16 +154,21 @@ jobs:
           <dict>
             <key>Label</key>
             <string>com.local.lidgrace.app</string>
+
             <key>ProgramArguments</key>
             <array>
               <string>/Applications/LidGrace.app/Contents/MacOS/LidGrace</string>
             </array>
+
             <key>RunAtLoad</key>
             <true/>
+
             <key>KeepAlive</key>
             <true/>
+
             <key>StandardOutPath</key>
             <string>$HOME/Library/Logs/lidgrace.app.log</string>
+
             <key>StandardErrorPath</key>
             <string>$HOME/Library/Logs/lidgrace.app.err</string>
           </dict>
@@ -156,24 +187,71 @@ jobs:
           launchctl kickstart -k "gui/$USER_ID/com.local.lidgrace.app"
 
           open -a LidGrace || true
+
           echo "Installed LidGrace."
           SH
 
           chmod +x Dist/LidGrace/install-prebuilt.sh
-          ditto -c -k --sequesterRsrc --keepParent Dist/LidGrace "LidGrace-${VERSION}-macos15-arm64.zip"
+
+          ditto -c -k --sequesterRsrc --keepParent Dist/LidGrace "$ZIP_NAME"
+
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: LidGrace-macos15-arm64
-          path: LidGrace-*-macos15-arm64.zip
+          path: ${{ env.ZIP_NAME }}
 
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            LidGrace-"$GITHUB_REF_NAME"-macos15-arm64.zip \
-            --title "LidGrace $GITHUB_REF_NAME" \
-            --notes "macOS 15 arm64 build."
+          set -euo pipefail
+
+          ZIP_FILE="$ZIP_NAME"
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            RELEASE_TAG="$GITHUB_REF_NAME"
+            RELEASE_TITLE="LidGrace $GITHUB_REF_NAME"
+            RELEASE_NOTES="macOS 15 arm64 release build."
+            IS_NIGHTLY="0"
+          else
+            RELEASE_TAG="nightly"
+            RELEASE_TITLE="LidGrace nightly"
+            RELEASE_NOTES="Automatic macOS 15 arm64 build from main branch. Commit: $GITHUB_SHA"
+            IS_NIGHTLY="1"
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            git tag -f nightly "$GITHUB_SHA"
+            git push -f origin nightly
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$ZIP_FILE" --clobber
+
+            if [[ "$IS_NIGHTLY" == "1" ]]; then
+              gh release edit "$RELEASE_TAG" \
+                --title "$RELEASE_TITLE" \
+                --notes "$RELEASE_NOTES" \
+                --prerelease
+            else
+              gh release edit "$RELEASE_TAG" \
+                --title "$RELEASE_TITLE" \
+                --notes "$RELEASE_NOTES"
+            fi
+          else
+            if [[ "$IS_NIGHTLY" == "1" ]]; then
+              gh release create "$RELEASE_TAG" "$ZIP_FILE" \
+                --title "$RELEASE_TITLE" \
+                --notes "$RELEASE_NOTES" \
+                --prerelease
+            else
+              gh release create "$RELEASE_TAG" "$ZIP_FILE" \
+                --title "$RELEASE_TITLE" \
+                --notes "$RELEASE_NOTES"
+            fi
+          fi
